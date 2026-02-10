@@ -17,7 +17,7 @@ import random
 
 from max.graph import Graph, TensorType
 from max.dtype import DType
-from max.driver import CPU
+from max.driver import Accelerator, Buffer
 from max.engine import InferenceSession
 
 
@@ -25,7 +25,7 @@ from max.engine import InferenceSession
 # Compile MAX Graphs (once at module load)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_cpu = CPU()
+_gpu = Accelerator()
 
 
 def _build_bullet_update_graph():
@@ -38,11 +38,11 @@ def _build_bullet_update_graph():
         "bullet_update",
         forward=forward,
         input_types=[
-            TensorType(DType.float32, ("n",), _cpu),  # x
-            TensorType(DType.float32, ("n",), _cpu),  # y
-            TensorType(DType.float32, ("n",), _cpu),  # vx
-            TensorType(DType.float32, ("n",), _cpu),  # vy
-            TensorType(DType.float32, (1,), _cpu),     # dt (broadcasts)
+            TensorType(DType.float32, ("n",), _gpu),  # x
+            TensorType(DType.float32, ("n",), _gpu),  # y
+            TensorType(DType.float32, ("n",), _gpu),  # vx
+            TensorType(DType.float32, ("n",), _gpu),  # vy
+            TensorType(DType.float32, (1,), _gpu),     # dt (broadcasts)
         ],
     )
 
@@ -63,21 +63,21 @@ def _build_particle_update_graph():
         "particle_update",
         forward=forward,
         input_types=[
-            TensorType(DType.float32, ("n",), _cpu),  # x
-            TensorType(DType.float32, ("n",), _cpu),  # y
-            TensorType(DType.float32, ("n",), _cpu),  # vx
-            TensorType(DType.float32, ("n",), _cpu),  # vy
-            TensorType(DType.float32, ("n",), _cpu),  # life
-            TensorType(DType.float32, (1,), _cpu),     # dt (broadcasts)
-            TensorType(DType.float32, (1,), _cpu),     # decay (broadcasts)
+            TensorType(DType.float32, ("n",), _gpu),  # x
+            TensorType(DType.float32, ("n",), _gpu),  # y
+            TensorType(DType.float32, ("n",), _gpu),  # vx
+            TensorType(DType.float32, ("n",), _gpu),  # vy
+            TensorType(DType.float32, ("n",), _gpu),  # life
+            TensorType(DType.float32, (1,), _gpu),     # dt (broadcasts)
+            TensorType(DType.float32, (1,), _gpu),     # decay (broadcasts)
         ],
     )
 
 
-_session = InferenceSession(devices=[_cpu])
+_session = InferenceSession(devices=[_gpu])
 _bullet_model = _session.load(_build_bullet_update_graph())
 _particle_model = _session.load(_build_particle_update_graph())
-print("MAX Graph models compiled successfully")
+print(f"MAX Graph models compiled successfully on {_gpu}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -102,7 +102,13 @@ def update_bullets(x: np.ndarray, y: np.ndarray,
         return x, y, vx, vy
 
     dt_arr = np.array([dt], dtype=np.float32)
-    results = _bullet_model.execute(x, y, vx, vy, dt_arr)
+    results = _bullet_model.execute(
+        Buffer.from_numpy(x).to(_gpu),
+        Buffer.from_numpy(y).to(_gpu),
+        Buffer.from_numpy(vx).to(_gpu),
+        Buffer.from_numpy(vy).to(_gpu),
+        Buffer.from_numpy(dt_arr).to(_gpu),
+    )
     return (
         results[0].to_numpy(),
         results[1].to_numpy(),
@@ -136,7 +142,15 @@ def update_particles(x: np.ndarray, y: np.ndarray,
 
     dt_arr = np.array([dt], dtype=np.float32)
     decay_arr = np.array([0.98], dtype=np.float32)
-    results = _particle_model.execute(x, y, vx, vy, life, dt_arr, decay_arr)
+    results = _particle_model.execute(
+        Buffer.from_numpy(x).to(_gpu),
+        Buffer.from_numpy(y).to(_gpu),
+        Buffer.from_numpy(vx).to(_gpu),
+        Buffer.from_numpy(vy).to(_gpu),
+        Buffer.from_numpy(life).to(_gpu),
+        Buffer.from_numpy(dt_arr).to(_gpu),
+        Buffer.from_numpy(decay_arr).to(_gpu),
+    )
 
     new_x = results[0].to_numpy()
     new_y = results[1].to_numpy()
