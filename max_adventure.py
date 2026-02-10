@@ -33,8 +33,14 @@ except ImportError:
 from tensor_ops import (
     update_bullets,
     update_particles,
+    update_bullets_tensors,
+    update_particles_tensors,
     generate_explosion_particles,
     generate_trail_particle,
+    dict_to_tensors,
+    concat_tensors,
+    filter_tensors,
+    MAX_AVAILABLE,
 )
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -402,12 +408,20 @@ class Game:
         self.player_bullets = []  # [(x, y, vy), ...]
         self.shoot_timer = 0.0
 
-        # Enemy bullets as SoA dict
-        self.bullets = {'x': [], 'y': [], 'vx': [], 'vy': []}
+        # Enemy bullets — stored as tensors if MAX available, else dict
+        if MAX_AVAILABLE:
+            self.bullets = None  # Will be tuple of tensors when populated
+            self.use_tensors = True
+        else:
+            self.bullets = {'x': [], 'y': [], 'vx': [], 'vy': []}
+            self.use_tensors = False
         self.bullet_colors_idx = []  # color index per bullet
 
-        # Particles as SoA dict
-        self.particles = {'x': [], 'y': [], 'vx': [], 'vy': [], 'life': []}
+        # Particles — stored as tensors if MAX available, else dict
+        if MAX_AVAILABLE:
+            self.particles = None  # Will be tuple of tensors when populated
+        else:
+            self.particles = {'x': [], 'y': [], 'vx': [], 'vy': [], 'life': []}
 
         # Scene
         self.stars = StarField()
@@ -486,10 +500,11 @@ class Game:
                         self.boss.take_damage(2)
                         self.score += 10
                         # Spawn hit particle
-                        extend_particles(
-                            self.particles,
-                            generate_explosion_particles(pb[0], pb[1], 5, 80)
-                        )
+                        hit_particles = generate_explosion_particles(pb[0], pb[1], 5, 80)
+                        if self.use_tensors:
+                            self.particles = concat_tensors(self.particles, hit_particles)
+                        else:
+                            extend_particles(self.particles, hit_particles)
                         new_pb.pop()  # remove this bullet
                         continue
         self.player_bullets = new_pb
@@ -498,43 +513,78 @@ class Game:
         new_enemy = self.boss.update(dt)
         if new_enemy['x']:
             num_new = len(new_enemy['x'])
-            extend_bullets(self.bullets, new_enemy)
+            if self.use_tensors:
+                self.bullets = concat_tensors(self.bullets, new_enemy)
+            else:
+                extend_bullets(self.bullets, new_enemy)
             for _ in range(num_new):
                 self.bullet_colors_idx.append(
                     random.randint(0, len(BULLET_COLORS) - 1)
                 )
 
         # ── Update enemy bullets (tensor_ops) ───────────────────────
-        if self.bullets['x']:
-            # Use MAX tensor ops with Python fallback
+        if self.use_tensors and self.bullets is not None:
+            # Use MAX tensors - no conversion overhead!
+            x_t, y_t, vx_t, vy_t = self.bullets
+            if len(x_t.to_numpy()) > 0 and x_t.to_numpy()[0] != 0.0:  # Check not empty placeholder
+                self.bullets = update_bullets_tensors(x_t, y_t, vx_t, vy_t, dt)
+        elif not self.use_tensors and self.bullets['x']:
+            # Python fallback
             self.bullets = update_bullets(self.bullets, dt)
 
         # ── Cull off-screen bullets ──────────────────────────────────────────
-        culled_x, culled_y, culled_vx, culled_vy = [], [], [], []
-        culled_colors = []
         margin = 40
-        for i in range(len(self.bullets['x'])):
-            bx = self.bullets['x'][i]
-            by = self.bullets['y'][i]
-            if -margin < bx < SCREEN_W + margin and -margin < by < SCREEN_H + margin:
-                culled_x.append(bx)
-                culled_y.append(by)
-                culled_vx.append(self.bullets['vx'][i])
-                culled_vy.append(self.bullets['vy'][i])
-                if i < len(self.bullet_colors_idx):
-                    culled_colors.append(self.bullet_colors_idx[i])
-                else:
-                    culled_colors.append(0)
-        self.bullets = {'x': culled_x, 'y': culled_y, 'vx': culled_vx, 'vy': culled_vy}
-        self.bullet_colors_idx = culled_colors
+        if self.use_tensors and self.bullets is not None:
+            import numpy as np
+            x_t, y_t, vx_t, vy_t = self.bullets
+            x_np = x_t.to_numpy()
+            y_np = y_t.to_numpy()
 
-        # ── Collision detection ──────────────────────────────────────────────
-        self.invincible_timer = max(0, self.invincible_timer - dt)
-        if self.bullets['x']:
-            hits = []
+            if len(x_np) > 0 and x_np[0] != 0.0:  # Check not empty placeholder
+                # Create mask for bullets within bounds
+                mask = ((x_np > -margin) & (x_np < SCREEN_W + margin) &
+                        (y_np > -margin) & (y_np < SCREEN_H + margin))
+
+                self.bullets = filter_tensors(self.bullets, mask)
+                self.bullet_colors_idx = [c for i, c in enumerate(self.bullet_colors_idx) if mask[i]]
+        elif not self.use_tensors:
+            culled_x, culled_y, culled_vx, culled_vy = [], [], [], []
+            culled_colors = []
             for i in range(len(self.bullets['x'])):
                 bx = self.bullets['x'][i]
                 by = self.bullets['y'][i]
+                if -margin < bx < SCREEN_W + margin and -margin < by < SCREEN_H + margin:
+                    culled_x.append(bx)
+                    culled_y.append(by)
+                    culled_vx.append(self.bullets['vx'][i])
+                    culled_vy.append(self.bullets['vy'][i])
+                    if i < len(self.bullet_colors_idx):
+                        culled_colors.append(self.bullet_colors_idx[i])
+                    else:
+                        culled_colors.append(0)
+            self.bullets = {'x': culled_x, 'y': culled_y, 'vx': culled_vx, 'vy': culled_vy}
+            self.bullet_colors_idx = culled_colors
+
+        # ── Collision detection ──────────────────────────────────────────────
+        self.invincible_timer = max(0, self.invincible_timer - dt)
+
+        # Get bullet positions as numpy arrays
+        if self.use_tensors and self.bullets is not None:
+            import numpy as np
+            x_t, y_t, vx_t, vy_t = self.bullets
+            bx_np = x_t.to_numpy()
+            by_np = y_t.to_numpy()
+            has_bullets = len(bx_np) > 0 and bx_np[0] != 0.0
+        else:
+            bx_np = self.bullets['x']
+            by_np = self.bullets['y']
+            has_bullets = len(bx_np) > 0
+
+        if has_bullets:
+            hits = []
+            for i in range(len(bx_np)):
+                bx = bx_np[i]
+                by = by_np[i]
                 dx = bx - self.px
                 dy = by - self.py
                 if dx*dx + dy*dy < (PLAYER_RADIUS + BULLET_RADIUS) ** 2:
@@ -545,17 +595,18 @@ class Game:
                 self.invincible_timer = 2.0
                 self.shake_timer = 0.3
                 # Death explosion particles
-                extend_particles(
-                    self.particles,
-                    generate_explosion_particles(self.px, self.py, 30, 250)
-                )
+                new_particles = generate_explosion_particles(self.px, self.py, 30, 250)
+                if self.use_tensors:
+                    self.particles = concat_tensors(self.particles, new_particles)
+                else:
+                    extend_particles(self.particles, new_particles)
                 if self.lives <= 0:
                     self.state = "gameover"
 
             # ── Graze scoring ────────────────────────────────────────────────
-            for i in range(len(self.bullets['x'])):
-                bx = self.bullets['x'][i]
-                by = self.bullets['y'][i]
+            for i in range(len(bx_np)):
+                bx = bx_np[i]
+                by = by_np[i]
                 dx = bx - self.px
                 dy = by - self.py
                 dist_sq = dx*dx + dy*dy
@@ -564,24 +615,34 @@ class Game:
                     self.score += 1
 
         # ── Update particles (tensor_ops) ───────────────────────────
-        if self.particles['x']:
-            # Use MAX tensor ops with Python fallback
+        if self.use_tensors and self.particles is not None:
+            x_t, y_t, vx_t, vy_t, life_list = self.particles
+            if len(x_t.to_numpy()) > 0 and x_t.to_numpy()[0] != 0.0:
+                new_x, new_y, new_vx, new_vy, new_life, alive_mask = \
+                    update_particles_tensors(x_t, y_t, vx_t, vy_t, life_list, dt)
+                self.particles = filter_tensors(
+                    (new_x, new_y, new_vx, new_vy, new_life),
+                    alive_mask
+                )
+        elif not self.use_tensors and self.particles['x']:
             self.particles = update_particles(self.particles, dt)
 
         # Trail particles
         if self.frame % 3 == 0:
-            extend_particles(
-                self.particles,
-                generate_trail_particle(self.px, self.py + 14)
-            )
+            new_trail = generate_trail_particle(self.px, self.py + 14)
+            if self.use_tensors:
+                self.particles = concat_tensors(self.particles, new_trail)
+            else:
+                extend_particles(self.particles, new_trail)
 
         # Victory condition
         if not self.boss.alive:
             self.state = "victory"
-            extend_particles(
-                self.particles,
-                generate_explosion_particles(self.boss.x, self.boss.y, 60, 300)
-            )
+            new_explosion = generate_explosion_particles(self.boss.x, self.boss.y, 60, 300)
+            if self.use_tensors:
+                self.particles = concat_tensors(self.particles, new_explosion)
+            else:
+                extend_particles(self.particles, new_explosion)
 
     # ─── Draw ────────────────────────────────────────────────────────────────
 
@@ -598,25 +659,54 @@ class Game:
             return
 
         # Particles (behind everything)
-        for i in range(len(self.particles['x'])):
-            px = self.particles['x'][i] + sx
-            py_coord = self.particles['y'][i] + sy
-            life = self.particles['life'][i]
-            alpha = min(255, int(life * 400))
-            r = max(1, int(life * 6))
-            color = (
-                min(255, int(255 * life * 2)),
-                min(255, int(160 * life * 2)),
-                min(255, int(40 * life * 2)),
-            )
-            pygame.draw.circle(self.screen, color, (int(px), int(py_coord)), r)
+        if self.use_tensors and self.particles is not None:
+            x_t, y_t, vx_t, vy_t, life_list = self.particles
+            px_np = x_t.to_numpy()
+            py_np = y_t.to_numpy()
+            if len(px_np) > 0 and px_np[0] != 0.0:
+                for i in range(len(px_np)):
+                    px = px_np[i] + sx
+                    py_coord = py_np[i] + sy
+                    life = life_list[i]
+                    alpha = min(255, int(life * 400))
+                    r = max(1, int(life * 6))
+                    color = (
+                        min(255, int(255 * life * 2)),
+                        min(255, int(160 * life * 2)),
+                        min(255, int(40 * life * 2)),
+                    )
+                    pygame.draw.circle(self.screen, color, (int(px), int(py_coord)), r)
+        elif not self.use_tensors:
+            for i in range(len(self.particles['x'])):
+                px = self.particles['x'][i] + sx
+                py_coord = self.particles['y'][i] + sy
+                life = self.particles['life'][i]
+                alpha = min(255, int(life * 400))
+                r = max(1, int(life * 6))
+                color = (
+                    min(255, int(255 * life * 2)),
+                    min(255, int(160 * life * 2)),
+                    min(255, int(40 * life * 2)),
+                )
+                pygame.draw.circle(self.screen, color, (int(px), int(py_coord)), r)
 
         # Enemy bullets
-        for i in range(len(self.bullets['x'])):
-            bx = self.bullets['x'][i] + sx
-            by = self.bullets['y'][i] + sy
-            cidx = self.bullet_colors_idx[i] if i < len(self.bullet_colors_idx) else 0
-            draw_bullet(self.screen, bx, by, BULLET_COLORS[cidx])
+        if self.use_tensors and self.bullets is not None:
+            x_t, y_t, vx_t, vy_t = self.bullets
+            bx_np = x_t.to_numpy()
+            by_np = y_t.to_numpy()
+            if len(bx_np) > 0 and bx_np[0] != 0.0:
+                for i in range(len(bx_np)):
+                    bx = bx_np[i] + sx
+                    by = by_np[i] + sy
+                    cidx = self.bullet_colors_idx[i] if i < len(self.bullet_colors_idx) else 0
+                    draw_bullet(self.screen, bx, by, BULLET_COLORS[cidx])
+        elif not self.use_tensors:
+            for i in range(len(self.bullets['x'])):
+                bx = self.bullets['x'][i] + sx
+                by = self.bullets['y'][i] + sy
+                cidx = self.bullet_colors_idx[i] if i < len(self.bullet_colors_idx) else 0
+                draw_bullet(self.screen, bx, by, BULLET_COLORS[cidx])
 
         # Player bullets
         for pb in self.player_bullets:
@@ -665,9 +755,20 @@ class Game:
         self.screen.blit(graze_text, (SCREEN_W - graze_text.get_width() - 16, 38))
 
         # Bullet count (performance indicator)
-        n_bullets = len(self.bullets['x'])
-        n_particles = len(self.particles['x'])
-        engine = "🔥 Mojo" if MOJO_PHYSICS else "🐍 Python"
+        if self.use_tensors:
+            n_bullets = len(self.bullets[0].to_numpy()) if self.bullets else 0
+            n_particles = len(self.particles[0].to_numpy()) if self.particles else 0
+            # Don't count empty placeholders
+            if n_bullets > 0 and self.bullets[0].to_numpy()[0] == 0.0:
+                n_bullets = 0
+            if n_particles > 0 and self.particles[0].to_numpy()[0] == 0.0:
+                n_particles = 0
+            engine = "🔥 MAX Tensors"
+        else:
+            n_bullets = len(self.bullets['x'])
+            n_particles = len(self.particles['x'])
+            engine = "🐍 Python"
+
         perf_text = self.font_small.render(
             f"{engine} | Bullets: {n_bullets} | Particles: {n_particles}",
             True, (100, 100, 140)
