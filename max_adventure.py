@@ -31,8 +31,8 @@ except ImportError:
     print("⚠  Mojo physics engine not available — using Python fallback")
 
 from tensor_ops import (
-    batch_update_positions,
-    batch_distance_squared,
+    update_bullets,
+    update_particles,
     generate_explosion_particles,
     generate_trail_particle,
 )
@@ -466,21 +466,15 @@ class Game:
                     random.randint(0, len(BULLET_COLORS) - 1)
                 )
 
-        # ── Update enemy bullets (Mojo or Python) ───────────────────────────
+        # ── Update enemy bullets (Mojo or tensor_ops) ───────────────────────
         if self.bullets_flat:
             if MOJO_PHYSICS:
                 self.bullets_flat = list(
                     physics_engine.update_bullets(self.bullets_flat, dt)
                 )
             else:
-                # Python fallback — same flat-list stride-4 update
-                updated = []
-                for i in range(0, len(self.bullets_flat), 4):
-                    x  = self.bullets_flat[i]     + self.bullets_flat[i+2] * dt
-                    y  = self.bullets_flat[i + 1]  + self.bullets_flat[i+3] * dt
-                    updated.extend([x, y, self.bullets_flat[i+2],
-                                    self.bullets_flat[i+3]])
-                self.bullets_flat = updated
+                # Use MAX tensor ops with Python fallback
+                self.bullets_flat = update_bullets(self.bullets_flat, dt)
 
         # ── Cull off-screen bullets ──────────────────────────────────────────
         culled = []
@@ -538,23 +532,15 @@ class Game:
                     self.graze_count += 1
                     self.score += 1
 
-        # ── Update particles (Mojo or Python) ───────────────────────────────
+        # ── Update particles (Mojo or tensor_ops) ───────────────────────────
         if self.particles_flat:
             if MOJO_PHYSICS:
                 self.particles_flat = list(
                     physics_engine.update_particles(self.particles_flat, dt)
                 )
             else:
-                updated = []
-                for i in range(0, len(self.particles_flat), 5):
-                    x    = self.particles_flat[i]   + self.particles_flat[i+2] * dt
-                    y    = self.particles_flat[i+1]  + self.particles_flat[i+3] * dt
-                    vx   = self.particles_flat[i+2] * 0.98
-                    vy   = self.particles_flat[i+3] * 0.98
-                    life = self.particles_flat[i+4] - dt
-                    if life > 0:
-                        updated.extend([x, y, vx, vy, life])
-                self.particles_flat = updated
+                # Use MAX tensor ops with Python fallback
+                self.particles_flat = update_particles(self.particles_flat, dt)
 
         # Trail particles
         if self.frame % 3 == 0:
