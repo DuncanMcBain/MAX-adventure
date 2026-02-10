@@ -38,6 +38,20 @@ from tensor_ops import (
 )
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Helper Functions
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def extend_particles(target: dict, source: dict):
+    """Append all particles from source dict to target dict."""
+    for key in ['x', 'y', 'vx', 'vy', 'life']:
+        target[key].extend(source[key])
+
+def extend_bullets(target: dict, source: dict):
+    """Append all bullets from source dict to target dict."""
+    for key in ['x', 'y', 'vx', 'vy']:
+        target[key].extend(source[key])
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Constants
 # ═══════════════════════════════════════════════════════════════════════════════
 SCREEN_W, SCREEN_H = 800, 600
@@ -198,10 +212,10 @@ class BossPattern:
         self.alive = True
         self.flash_timer = 0.0
 
-    def update(self, dt: float) -> list:
-        """Update boss and return new bullets as flat list [x,y,vx,vy,...]."""
+    def update(self, dt: float) -> dict:
+        """Update boss and return new bullets as SoA dict."""
         if not self.alive:
-            return []
+            return {'x': [], 'y': [], 'vx': [], 'vy': []}
 
         self.timer += dt
         self.pattern_timer += dt
@@ -222,16 +236,23 @@ class BossPattern:
         else:
             self.phase = 2
 
-        new_bullets = []
+        new_bullets = {'x': [], 'y': [], 'vx': [], 'vy': []}
 
         if self.phase == 0:
             # Phase 1: Slow radial bursts every 1.2s
             if self.pattern_timer > 1.2:
                 self.pattern_timer = 0
+                # Mojo code path remains unchanged but won't execute since MOJO_PHYSICS=False
                 if MOJO_PHYSICS:
-                    new_bullets = list(physics_engine.spawn_radial_burst(
+                    flat = list(physics_engine.spawn_radial_burst(
                         self.x, self.y, 120.0, 16
                     ))
+                    # Convert flat to dict (won't execute)
+                    for i in range(0, len(flat), 4):
+                        new_bullets['x'].append(flat[i])
+                        new_bullets['y'].append(flat[i+1])
+                        new_bullets['vx'].append(flat[i+2])
+                        new_bullets['vy'].append(flat[i+3])
                 else:
                     new_bullets = self._py_radial(self.x, self.y, 120.0, 16)
 
@@ -241,9 +262,14 @@ class BossPattern:
                 self.pattern_timer = 0
                 self.spiral_angle += 0.4
                 if MOJO_PHYSICS:
-                    new_bullets = list(physics_engine.spawn_spiral_burst(
+                    flat = list(physics_engine.spawn_spiral_burst(
                         self.x, self.y, 140.0, 3, self.spiral_angle
                     ))
+                    for i in range(0, len(flat), 4):
+                        new_bullets['x'].append(flat[i])
+                        new_bullets['y'].append(flat[i+1])
+                        new_bullets['vx'].append(flat[i+2])
+                        new_bullets['vy'].append(flat[i+3])
                 else:
                     new_bullets = self._py_spiral(
                         self.x, self.y, 140.0, 3, self.spiral_angle
@@ -258,7 +284,11 @@ class BossPattern:
                     spiral = list(physics_engine.spawn_spiral_burst(
                         self.x, self.y, 180.0, 5, self.spiral_angle
                     ))
-                    new_bullets = spiral
+                    for i in range(0, len(spiral), 4):
+                        new_bullets['x'].append(spiral[i])
+                        new_bullets['y'].append(spiral[i+1])
+                        new_bullets['vx'].append(spiral[i+2])
+                        new_bullets['vy'].append(spiral[i+3])
                 else:
                     new_bullets = self._py_spiral(
                         self.x, self.y, 180.0, 5, self.spiral_angle
@@ -270,11 +300,14 @@ class BossPattern:
                     radial = list(physics_engine.spawn_radial_burst(
                         self.x, self.y, 100.0, 24
                     ))
-                    new_bullets.extend(radial)
+                    for i in range(0, len(radial), 4):
+                        new_bullets['x'].append(radial[i])
+                        new_bullets['y'].append(radial[i+1])
+                        new_bullets['vx'].append(radial[i+2])
+                        new_bullets['vy'].append(radial[i+3])
                 else:
-                    new_bullets.extend(
-                        self._py_radial(self.x, self.y, 100.0, 24)
-                    )
+                    radial = self._py_radial(self.x, self.y, 100.0, 24)
+                    extend_bullets(new_bullets, radial)
 
         return new_bullets
 
@@ -319,21 +352,25 @@ class BossPattern:
     # Pure Python fallbacks for bullet patterns
     @staticmethod
     def _py_radial(cx, cy, speed, count):
-        result = []
+        xs, ys, vxs, vys = [], [], [], []
         for i in range(count):
             angle = 2 * math.pi * i / count
-            result.extend([cx, cy, math.cos(angle) * speed,
-                           math.sin(angle) * speed])
-        return result
+            xs.append(cx)
+            ys.append(cy)
+            vxs.append(math.cos(angle) * speed)
+            vys.append(math.sin(angle) * speed)
+        return {'x': xs, 'y': ys, 'vx': vxs, 'vy': vys}
 
     @staticmethod
     def _py_spiral(cx, cy, speed, count, offset):
-        result = []
+        xs, ys, vxs, vys = [], [], [], []
         for i in range(count):
             angle = 2 * math.pi * i / count + offset
-            result.extend([cx, cy, math.cos(angle) * speed,
-                           math.sin(angle) * speed])
-        return result
+            xs.append(cx)
+            ys.append(cy)
+            vxs.append(math.cos(angle) * speed)
+            vys.append(math.sin(angle) * speed)
+        return {'x': xs, 'y': ys, 'vx': vxs, 'vy': vys}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -365,12 +402,12 @@ class Game:
         self.player_bullets = []  # [(x, y, vy), ...]
         self.shoot_timer = 0.0
 
-        # Enemy bullets as flat list: [x, y, vx, vy, ...]
-        self.bullets_flat = []
+        # Enemy bullets as SoA dict
+        self.bullets = {'x': [], 'y': [], 'vx': [], 'vy': []}
         self.bullet_colors_idx = []  # color index per bullet
 
-        # Particles as flat list: [x, y, vx, vy, life, ...]
-        self.particles_flat = []
+        # Particles as SoA dict
+        self.particles = {'x': [], 'y': [], 'vx': [], 'vy': [], 'life': []}
 
         # Scene
         self.stars = StarField()
@@ -449,7 +486,8 @@ class Game:
                         self.boss.take_damage(2)
                         self.score += 10
                         # Spawn hit particle
-                        self.particles_flat.extend(
+                        extend_particles(
+                            self.particles,
                             generate_explosion_particles(pb[0], pb[1], 5, 80)
                         )
                         new_pb.pop()  # remove this bullet
@@ -458,73 +496,66 @@ class Game:
 
         # Boss update — get new enemy bullets
         new_enemy = self.boss.update(dt)
-        if new_enemy:
-            num_new = len(new_enemy) // 4
-            self.bullets_flat.extend(new_enemy)
+        if new_enemy['x']:
+            num_new = len(new_enemy['x'])
+            extend_bullets(self.bullets, new_enemy)
             for _ in range(num_new):
                 self.bullet_colors_idx.append(
                     random.randint(0, len(BULLET_COLORS) - 1)
                 )
 
-        # ── Update enemy bullets (Mojo or tensor_ops) ───────────────────────
-        if self.bullets_flat:
-            if MOJO_PHYSICS:
-                self.bullets_flat = list(
-                    physics_engine.update_bullets(self.bullets_flat, dt)
-                )
-            else:
-                # Use MAX tensor ops with Python fallback
-                self.bullets_flat = update_bullets(self.bullets_flat, dt)
+        # ── Update enemy bullets (tensor_ops) ───────────────────────
+        if self.bullets['x']:
+            # Use MAX tensor ops with Python fallback
+            self.bullets = update_bullets(self.bullets, dt)
 
         # ── Cull off-screen bullets ──────────────────────────────────────────
-        culled = []
+        culled_x, culled_y, culled_vx, culled_vy = [], [], [], []
         culled_colors = []
         margin = 40
-        for i in range(0, len(self.bullets_flat), 4):
-            bx = self.bullets_flat[i]
-            by = self.bullets_flat[i + 1]
-            idx = i // 4
+        for i in range(len(self.bullets['x'])):
+            bx = self.bullets['x'][i]
+            by = self.bullets['y'][i]
             if -margin < bx < SCREEN_W + margin and -margin < by < SCREEN_H + margin:
-                culled.extend(self.bullets_flat[i:i+4])
-                if idx < len(self.bullet_colors_idx):
-                    culled_colors.append(self.bullet_colors_idx[idx])
+                culled_x.append(bx)
+                culled_y.append(by)
+                culled_vx.append(self.bullets['vx'][i])
+                culled_vy.append(self.bullets['vy'][i])
+                if i < len(self.bullet_colors_idx):
+                    culled_colors.append(self.bullet_colors_idx[i])
                 else:
                     culled_colors.append(0)
-        self.bullets_flat = culled
+        self.bullets = {'x': culled_x, 'y': culled_y, 'vx': culled_vx, 'vy': culled_vy}
         self.bullet_colors_idx = culled_colors
 
         # ── Collision detection ──────────────────────────────────────────────
         self.invincible_timer = max(0, self.invincible_timer - dt)
-        if self.bullets_flat:
-            if MOJO_PHYSICS:
-                hits = list(physics_engine.check_collisions(
-                    self.bullets_flat, self.px, self.py, PLAYER_RADIUS + BULLET_RADIUS
-                ))
-            else:
-                hits = []
-                for i in range(0, len(self.bullets_flat), 4):
-                    bx = self.bullets_flat[i]
-                    by = self.bullets_flat[i+1]
-                    dx = bx - self.px
-                    dy = by - self.py
-                    if dx*dx + dy*dy < (PLAYER_RADIUS + BULLET_RADIUS) ** 2:
-                        hits.append(i // 4)
+        if self.bullets['x']:
+            hits = []
+            for i in range(len(self.bullets['x'])):
+                bx = self.bullets['x'][i]
+                by = self.bullets['y'][i]
+                dx = bx - self.px
+                dy = by - self.py
+                if dx*dx + dy*dy < (PLAYER_RADIUS + BULLET_RADIUS) ** 2:
+                    hits.append(i)
 
             if hits and self.invincible_timer <= 0:
                 self.lives -= 1
                 self.invincible_timer = 2.0
                 self.shake_timer = 0.3
                 # Death explosion particles
-                self.particles_flat.extend(
+                extend_particles(
+                    self.particles,
                     generate_explosion_particles(self.px, self.py, 30, 250)
                 )
                 if self.lives <= 0:
                     self.state = "gameover"
 
             # ── Graze scoring ────────────────────────────────────────────────
-            for i in range(0, len(self.bullets_flat), 4):
-                bx = self.bullets_flat[i]
-                by = self.bullets_flat[i+1]
+            for i in range(len(self.bullets['x'])):
+                bx = self.bullets['x'][i]
+                by = self.bullets['y'][i]
                 dx = bx - self.px
                 dy = by - self.py
                 dist_sq = dx*dx + dy*dy
@@ -532,26 +563,23 @@ class Game:
                     self.graze_count += 1
                     self.score += 1
 
-        # ── Update particles (Mojo or tensor_ops) ───────────────────────────
-        if self.particles_flat:
-            if MOJO_PHYSICS:
-                self.particles_flat = list(
-                    physics_engine.update_particles(self.particles_flat, dt)
-                )
-            else:
-                # Use MAX tensor ops with Python fallback
-                self.particles_flat = update_particles(self.particles_flat, dt)
+        # ── Update particles (tensor_ops) ───────────────────────────
+        if self.particles['x']:
+            # Use MAX tensor ops with Python fallback
+            self.particles = update_particles(self.particles, dt)
 
         # Trail particles
         if self.frame % 3 == 0:
-            self.particles_flat.extend(
+            extend_particles(
+                self.particles,
                 generate_trail_particle(self.px, self.py + 14)
             )
 
         # Victory condition
         if not self.boss.alive:
             self.state = "victory"
-            self.particles_flat.extend(
+            extend_particles(
+                self.particles,
                 generate_explosion_particles(self.boss.x, self.boss.y, 60, 300)
             )
 
@@ -570,10 +598,10 @@ class Game:
             return
 
         # Particles (behind everything)
-        for i in range(0, len(self.particles_flat), 5):
-            px = self.particles_flat[i] + sx
-            py_coord = self.particles_flat[i+1] + sy
-            life = self.particles_flat[i+4]
+        for i in range(len(self.particles['x'])):
+            px = self.particles['x'][i] + sx
+            py_coord = self.particles['y'][i] + sy
+            life = self.particles['life'][i]
             alpha = min(255, int(life * 400))
             r = max(1, int(life * 6))
             color = (
@@ -584,11 +612,10 @@ class Game:
             pygame.draw.circle(self.screen, color, (int(px), int(py_coord)), r)
 
         # Enemy bullets
-        for i in range(0, len(self.bullets_flat), 4):
-            bx = self.bullets_flat[i] + sx
-            by = self.bullets_flat[i+1] + sy
-            idx = i // 4
-            cidx = self.bullet_colors_idx[idx] if idx < len(self.bullet_colors_idx) else 0
+        for i in range(len(self.bullets['x'])):
+            bx = self.bullets['x'][i] + sx
+            by = self.bullets['y'][i] + sy
+            cidx = self.bullet_colors_idx[i] if i < len(self.bullet_colors_idx) else 0
             draw_bullet(self.screen, bx, by, BULLET_COLORS[cidx])
 
         # Player bullets
@@ -638,8 +665,8 @@ class Game:
         self.screen.blit(graze_text, (SCREEN_W - graze_text.get_width() - 16, 38))
 
         # Bullet count (performance indicator)
-        n_bullets = len(self.bullets_flat) // 4
-        n_particles = len(self.particles_flat) // 5
+        n_bullets = len(self.bullets['x'])
+        n_particles = len(self.particles['x'])
         engine = "🔥 Mojo" if MOJO_PHYSICS else "🐍 Python"
         perf_text = self.font_small.render(
             f"{engine} | Bullets: {n_bullets} | Particles: {n_particles}",
