@@ -1,10 +1,25 @@
-[workspace]
-channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
-name = "MAX-adventure"
-platforms = ["linux-64"]
+[project]
+name = "max-adventure"
 version = "0.1.0"
+description = "MAX Adventure — A bullet hell game powered by Mojo, MAX Tensors, and Pygame"
+authors = ["MAX Adventure Team"]
 
-[tasks]
+# Modular conda channel for Mojo/MAX + conda-forge for Pygame
+channels = ["https://conda.modular.com/max-nightly/", "conda-forge"]
+platforms = ["linux-64", "osx-arm64"]
 
 [dependencies]
-modular = ">=26.2.0.dev2026020905,<27"
+# Core Modular stack
+modular = "*"
+# Python and Pygame
+python = ">=3.11"
+pygame = "*"
+# NumPy (used by MAX tensor .to_numpy() and general math fallbacks)
+numpy = "*"
+
+[tasks]
+# Main game entry point
+play = "python max_adventure.py"
+
+# Run with verbose Mojo import logging
+play-debug = "MODULAR_LOG_LEVEL=debug python max_adventure.py"
