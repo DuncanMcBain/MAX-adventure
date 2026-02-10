@@ -117,3 +117,126 @@ def generate_trail_particle(x: float, y: float) -> list:
     vy = random.uniform(10, 40)  # drift downward
     lifetime = random.uniform(0.15, 0.35)
     return [x, y, vx, vy, lifetime]
+
+
+def update_bullets(bullets_flat: list, dt: float) -> list:
+    """Update bullet positions using MAX tensors for vectorized computation.
+
+    Bullets are stored as flat list with stride 4: [x, y, vx, vy, ...]
+
+    Args:
+        bullets_flat: Flat list of [x0, y0, vx0, vy0, x1, y1, vx1, vy1, ...]
+        dt: Delta time in seconds
+
+    Returns:
+        Updated flat bullet list with same stride-4 format
+    """
+    if not bullets_flat:
+        return []
+
+    if MAX_AVAILABLE:
+        try:
+            # Extract positions and velocities with stride 4
+            positions = [bullets_flat[i] for i in range(0, len(bullets_flat), 4)] + \
+                       [bullets_flat[i] for i in range(1, len(bullets_flat), 4)]
+            velocities = [bullets_flat[i] for i in range(2, len(bullets_flat), 4)] + \
+                        [bullets_flat[i] for i in range(3, len(bullets_flat), 4)]
+
+            # Vectorized update
+            pos_tensor = Tensor.constant(positions)
+            vel_tensor = Tensor.constant(velocities)
+            dt_tensor = Tensor.constant([dt] * len(positions))
+
+            updated_pos = pos_tensor + vel_tensor * dt_tensor
+            updated_list = updated_pos.to_numpy().tolist()
+
+            # Reconstruct stride-4 format: [x, y, vx, vy, ...]
+            n_bullets = len(bullets_flat) // 4
+            result = []
+            for i in range(n_bullets):
+                result.extend([
+                    updated_list[i],                    # x
+                    updated_list[i + n_bullets],        # y
+                    bullets_flat[i * 4 + 2],            # vx (unchanged)
+                    bullets_flat[i * 4 + 3]             # vy (unchanged)
+                ])
+            return result
+        except Exception:
+            pass
+
+    # Pure Python fallback
+    updated = []
+    for i in range(0, len(bullets_flat), 4):
+        x = bullets_flat[i] + bullets_flat[i+2] * dt
+        y = bullets_flat[i+1] + bullets_flat[i+3] * dt
+        updated.extend([x, y, bullets_flat[i+2], bullets_flat[i+3]])
+    return updated
+
+
+def update_particles(particles_flat: list, dt: float) -> list:
+    """Update particle positions with velocity decay and lifetime.
+
+    Particles are stored as flat list with stride 5: [x, y, vx, vy, lifetime, ...]
+    Applies 0.98 velocity decay and filters out expired particles.
+
+    Args:
+        particles_flat: Flat list of [x0, y0, vx0, vy0, life0, ...]
+        dt: Delta time in seconds
+
+    Returns:
+        Updated flat particle list with expired particles removed
+    """
+    if not particles_flat:
+        return []
+
+    if MAX_AVAILABLE:
+        try:
+            n_particles = len(particles_flat) // 5
+
+            # Extract components
+            xs = [particles_flat[i*5] for i in range(n_particles)]
+            ys = [particles_flat[i*5+1] for i in range(n_particles)]
+            vxs = [particles_flat[i*5+2] for i in range(n_particles)]
+            vys = [particles_flat[i*5+3] for i in range(n_particles)]
+            lives = [particles_flat[i*5+4] for i in range(n_particles)]
+
+            # Vectorized position update
+            x_tensor = Tensor.constant(xs)
+            y_tensor = Tensor.constant(ys)
+            vx_tensor = Tensor.constant(vxs)
+            vy_tensor = Tensor.constant(vys)
+            dt_tensor = Tensor.constant([dt] * n_particles)
+            decay = Tensor.constant([0.98] * n_particles)
+
+            new_x = x_tensor + vx_tensor * dt_tensor
+            new_y = y_tensor + vy_tensor * dt_tensor
+            new_vx = vx_tensor * decay
+            new_vy = vy_tensor * decay
+
+            new_xs = new_x.to_numpy().tolist()
+            new_ys = new_y.to_numpy().tolist()
+            new_vxs = new_vx.to_numpy().tolist()
+            new_vys = new_vy.to_numpy().tolist()
+
+            # Reconstruct with lifetime filter
+            result = []
+            for i in range(n_particles):
+                new_life = lives[i] - dt
+                if new_life > 0:
+                    result.extend([new_xs[i], new_ys[i], new_vxs[i],
+                                  new_vys[i], new_life])
+            return result
+        except Exception:
+            pass
+
+    # Pure Python fallback
+    updated = []
+    for i in range(0, len(particles_flat), 5):
+        x = particles_flat[i] + particles_flat[i+2] * dt
+        y = particles_flat[i+1] + particles_flat[i+3] * dt
+        vx = particles_flat[i+2] * 0.98
+        vy = particles_flat[i+3] * 0.98
+        life = particles_flat[i+4] - dt
+        if life > 0:
+            updated.extend([x, y, vx, vy, life])
+    return updated
