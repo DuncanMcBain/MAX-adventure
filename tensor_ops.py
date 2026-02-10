@@ -1,101 +1,168 @@
-"""tensor_ops.py — MAX Tensor-accelerated batch physics for MAX Adventure.
+"""tensor_ops.py — MAX Graph API-accelerated batch physics for MAX Adventure.
 
-Uses the MAX Tensor API (max.tensor, max.functional, max.dtype) to perform
-batch operations on bullet and particle data. This demonstrates how MAX tensors
-can accelerate game physics through vectorized operations.
+Uses the MAX Graph API to compile optimized compute graphs for batch
+particle/bullet physics. Graphs are compiled once at import time and
+executed each frame with numpy arrays as I/O.
 
-The MAX Tensor API provides:
-  - Tensor.constant() for creating tensors from Python lists
-  - Element-wise arithmetic (+, -, *, /)
-  - Functional API (max.functional) for advanced ops like sqrt, abs
-  - Efficient dtype selection (float32 for speed, float64 for precision)
+The MAX Graph API provides:
+  - Graph() for defining symbolic computation graphs
+  - TensorType with symbolic dimensions for dynamic batch sizes
+  - InferenceSession for compiling graphs to optimized machine code
+  - Model.execute() for running compiled graphs with numpy array I/O
 """
 
-try:
-    from max.tensor import Tensor
-    from max.dtype import DType
-    import max.functional as F
-
-    MAX_AVAILABLE = True
-except ImportError:
-    MAX_AVAILABLE = False
-    print("[tensor_ops] MAX not available — falling back to pure Python math")
-
+import numpy as np
 import math
 import random
 
+from max.graph import Graph, TensorType
+from max.dtype import DType
+from max.driver import CPU
+from max.engine import InferenceSession
 
-def batch_update_positions(positions_flat: list, velocities_flat: list,
-                           dt: float) -> list:
-    """Update positions using MAX tensors for vectorized computation.
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Compile MAX Graphs (once at module load)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_cpu = CPU()
+
+
+def _build_bullet_update_graph():
+    """Graph: new_pos = pos + vel * dt"""
+
+    def forward(x, y, vx, vy, dt):
+        return x + vx * dt, y + vy * dt, vx, vy
+
+    return Graph(
+        "bullet_update",
+        forward=forward,
+        input_types=[
+            TensorType(DType.float32, ("n",), _cpu),  # x
+            TensorType(DType.float32, ("n",), _cpu),  # y
+            TensorType(DType.float32, ("n",), _cpu),  # vx
+            TensorType(DType.float32, ("n",), _cpu),  # vy
+            TensorType(DType.float32, (1,), _cpu),     # dt (broadcasts)
+        ],
+    )
+
+
+def _build_particle_update_graph():
+    """Graph: pos += vel * dt; vel *= decay; life -= dt"""
+
+    def forward(x, y, vx, vy, life, dt, decay):
+        return (
+            x + vx * dt,
+            y + vy * dt,
+            vx * decay,
+            vy * decay,
+            life - dt,
+        )
+
+    return Graph(
+        "particle_update",
+        forward=forward,
+        input_types=[
+            TensorType(DType.float32, ("n",), _cpu),  # x
+            TensorType(DType.float32, ("n",), _cpu),  # y
+            TensorType(DType.float32, ("n",), _cpu),  # vx
+            TensorType(DType.float32, ("n",), _cpu),  # vy
+            TensorType(DType.float32, ("n",), _cpu),  # life
+            TensorType(DType.float32, (1,), _cpu),     # dt (broadcasts)
+            TensorType(DType.float32, (1,), _cpu),     # decay (broadcasts)
+        ],
+    )
+
+
+_session = InferenceSession(devices=[_cpu])
+_bullet_model = _session.load(_build_bullet_update_graph())
+_particle_model = _session.load(_build_particle_update_graph())
+print("MAX Graph models compiled successfully")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Physics Update Functions
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def update_bullets(x: np.ndarray, y: np.ndarray,
+                   vx: np.ndarray, vy: np.ndarray,
+                   dt: float) -> tuple[np.ndarray, np.ndarray,
+                                       np.ndarray, np.ndarray]:
+    """Update bullet positions using compiled MAX graph.
 
     Args:
-        positions_flat: Flat list of [x0, y0, x1, y1, ...] positions
-        velocities_flat: Flat list of [vx0, vy0, vx1, vy1, ...] velocities
+        x, y: Position arrays (float32)
+        vx, vy: Velocity arrays (float32)
         dt: Delta time in seconds
 
     Returns:
-        Updated flat position list
+        Tuple of (new_x, new_y, vx, vy) numpy arrays
     """
-    if not positions_flat:
-        return []
+    if len(x) == 0:
+        return x, y, vx, vy
 
-    if MAX_AVAILABLE:
-        try:
-            pos_tensor = Tensor.constant(positions_flat)
-            vel_tensor = Tensor.constant(velocities_flat)
-            dt_tensor = Tensor.constant([dt] * len(positions_flat))
-
-            # Vectorized position update: pos += vel * dt
-            updated = pos_tensor + vel_tensor * dt_tensor
-            return updated.to_numpy().tolist()
-        except Exception:
-            pass
-
-    # Pure Python fallback
-    return [p + v * dt for p, v in zip(positions_flat, velocities_flat)]
+    dt_arr = np.array([dt], dtype=np.float32)
+    results = _bullet_model.execute(x, y, vx, vy, dt_arr)
+    return (
+        results[0].to_numpy(),
+        results[1].to_numpy(),
+        results[2].to_numpy(),
+        results[3].to_numpy(),
+    )
 
 
-def batch_distance_squared(bullet_xs: list, bullet_ys: list,
-                           player_x: float, player_y: float) -> list:
-    """Compute squared distances from player to all bullets using MAX tensors.
+def update_particles(x: np.ndarray, y: np.ndarray,
+                     vx: np.ndarray, vy: np.ndarray,
+                     life: np.ndarray,
+                     dt: float) -> tuple[np.ndarray, np.ndarray,
+                                         np.ndarray, np.ndarray,
+                                         np.ndarray]:
+    """Update particle positions/velocities/life using compiled MAX graph.
+
+    Applies velocity decay (0.98) and removes dead particles.
 
     Args:
-        bullet_xs: List of bullet x coordinates
-        bullet_ys: List of bullet y coordinates
-        player_x: Player x position
-        player_y: Player y position
+        x, y: Position arrays (float32)
+        vx, vy: Velocity arrays (float32)
+        life: Lifetime array (float32)
+        dt: Delta time in seconds
 
     Returns:
-        List of squared distances
+        Tuple of (new_x, new_y, new_vx, new_vy, new_life) with dead
+        particles filtered out.
     """
-    if not bullet_xs:
-        return []
+    if len(x) == 0:
+        return x, y, vx, vy, life
 
-    if MAX_AVAILABLE:
-        try:
-            bx = Tensor.constant(bullet_xs)
-            by = Tensor.constant(bullet_ys)
-            px = Tensor.constant([player_x] * len(bullet_xs))
-            py = Tensor.constant([player_y] * len(bullet_ys))
+    dt_arr = np.array([dt], dtype=np.float32)
+    decay_arr = np.array([0.98], dtype=np.float32)
+    results = _particle_model.execute(x, y, vx, vy, life, dt_arr, decay_arr)
 
-            dx = bx - px
-            dy = by - py
-            dist_sq = dx * dx + dy * dy
-            return dist_sq.to_numpy().tolist()
-        except Exception:
-            pass
+    new_x = results[0].to_numpy()
+    new_y = results[1].to_numpy()
+    new_vx = results[2].to_numpy()
+    new_vy = results[3].to_numpy()
+    new_life = results[4].to_numpy()
 
-    # Pure Python fallback
-    return [(bx - player_x) ** 2 + (by - player_y) ** 2
-            for bx, by in zip(bullet_xs, bullet_ys)]
+    # Filter out dead particles (shape-changing op, done outside the graph)
+    alive = new_life > 0
+    return (
+        new_x[alive], new_y[alive],
+        new_vx[alive], new_vy[alive],
+        new_life[alive],
+    )
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Particle Generation (pure Python — randomness not suited for graphs)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def generate_explosion_particles(cx: float, cy: float, count: int = 20,
                                  speed: float = 200.0) -> dict:
-    """Generate explosion particle data using MAX tensors for random angles.
+    """Generate explosion particle data.
 
-    Returns dict with SoA format: {'x': [...], 'y': [...], 'vx': [...], 'vy': [...], 'life': [...]}
+    Returns dict with SoA format:
+        {'x': [...], 'y': [...], 'vx': [...], 'vy': [...], 'life': [...]}
     """
     xs, ys, vxs, vys, lives = [], [], [], [], []
     for i in range(count):
@@ -115,7 +182,7 @@ def generate_explosion_particles(cx: float, cy: float, count: int = 20,
 def generate_trail_particle(x: float, y: float) -> dict:
     """Generate a single trail particle behind the player.
 
-    Returns: dict with single element in each array
+    Returns: dict with single-element lists for each field.
     """
     vx = random.uniform(-20, 20)
     vy = random.uniform(10, 40)  # drift downward
@@ -123,277 +190,83 @@ def generate_trail_particle(x: float, y: float) -> dict:
     return {'x': [x], 'y': [y], 'vx': [vx], 'vy': [vy], 'life': [lifetime]}
 
 
-def update_bullets_tensors(x_t, y_t, vx_t, vy_t, dt: float):
-    """Update bullet positions using MAX tensors (no conversion overhead).
+# ═══════════════════════════════════════════════════════════════════════════════
+# Numpy Array Utilities
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    Args:
-        x_t, y_t: Position tensors
-        vx_t, vy_t: Velocity tensors
-        dt: Delta time in seconds
-
-    Returns:
-        Tuple of (new_x, new_y, vx, vy) tensors
-    """
-    if MAX_AVAILABLE:
-        try:
-            n = len(x_t.to_numpy())
-            dt_tensor = Tensor.constant([dt] * n)
-
-            # Vectorized position update: pos += vel * dt
-            new_x = x_t + vx_t * dt_tensor
-            new_y = y_t + vy_t * dt_tensor
-
-            return new_x, new_y, vx_t, vy_t
-        except Exception:
-            pass
-
-    # Should not reach here if called correctly
-    raise RuntimeError("update_bullets_tensors called without MAX_AVAILABLE")
-
-
-def update_bullets(bullets: dict, dt: float) -> dict:
-    """Update bullet positions (list-based fallback).
-
-    Args:
-        bullets: Dict with separate arrays for x, y, vx, vy
-        dt: Delta time in seconds
-
-    Returns:
-        Updated dict with same structure
-    """
-    if not bullets['x']:
-        return bullets
-
-    # Pure Python fallback using dict format
+def empty_bullets() -> dict:
+    """Create empty bullet arrays (SoA format)."""
     return {
-        'x': [x + vx * dt for x, vx in zip(bullets['x'], bullets['vx'])],
-        'y': [y + vy * dt for y, vy in zip(bullets['y'], bullets['vy'])],
-        'vx': bullets['vx'],
-        'vy': bullets['vy']
+        'x': np.array([], dtype=np.float32),
+        'y': np.array([], dtype=np.float32),
+        'vx': np.array([], dtype=np.float32),
+        'vy': np.array([], dtype=np.float32),
     }
 
 
-def update_particles_tensors(x_t, y_t, vx_t, vy_t, life_t, dt: float):
-    """Update particle positions with velocity decay (no conversion overhead).
-
-    Args:
-        x_t, y_t: Position tensors
-        vx_t, vy_t: Velocity tensors
-        life_t: Lifetime tensor (or list if not tensor)
-        dt: Delta time in seconds
-
-    Returns:
-        Tuple of (new_x, new_y, new_vx, new_vy, new_life, alive_mask) tensors/arrays
-        alive_mask is a boolean numpy array indicating which particles are still alive
-    """
-    if MAX_AVAILABLE:
-        try:
-            n_particles = len(x_t.to_numpy())
-            dt_tensor = Tensor.constant([dt] * n_particles)
-            decay = Tensor.constant([0.98] * n_particles)
-
-            new_x = x_t + vx_t * dt_tensor
-            new_y = y_t + vy_t * dt_tensor
-            new_vx = vx_t * decay
-            new_vy = vy_t * decay
-
-            # Life is kept as list for now since we need to filter
-            # (MAX tensors don't have great boolean indexing support yet)
-            import numpy as np
-            life_np = np.array(life_t) - dt
-            alive_mask = life_np > 0
-
-            return new_x, new_y, new_vx, new_vy, life_np.tolist(), alive_mask
-        except Exception:
-            pass
-
-    raise RuntimeError("update_particles_tensors called without MAX_AVAILABLE")
-
-
-def update_particles(particles: dict, dt: float) -> dict:
-    """Update particle positions with velocity decay (list-based fallback).
-
-    Args:
-        particles: Dict with separate arrays for x, y, vx, vy, life
-        dt: Delta time in seconds
-
-    Returns:
-        Updated dict with expired particles removed
-    """
-    if not particles['x']:
-        return particles
-
-    # Pure Python fallback using dict format
-    filtered_xs, filtered_ys, filtered_vxs, filtered_vys, filtered_lives = [], [], [], [], []
-    for i in range(len(particles['x'])):
-        x = particles['x'][i] + particles['vx'][i] * dt
-        y = particles['y'][i] + particles['vy'][i] * dt
-        vx = particles['vx'][i] * 0.98
-        vy = particles['vy'][i] * 0.98
-        life = particles['life'][i] - dt
-        if life > 0:
-            filtered_xs.append(x)
-            filtered_ys.append(y)
-            filtered_vxs.append(vx)
-            filtered_vys.append(vy)
-            filtered_lives.append(life)
-
+def empty_particles() -> dict:
+    """Create empty particle arrays (SoA format)."""
     return {
-        'x': filtered_xs,
-        'y': filtered_ys,
-        'vx': filtered_vxs,
-        'vy': filtered_vys,
-        'life': filtered_lives
+        'x': np.array([], dtype=np.float32),
+        'y': np.array([], dtype=np.float32),
+        'vx': np.array([], dtype=np.float32),
+        'vy': np.array([], dtype=np.float32),
+        'life': np.array([], dtype=np.float32),
     }
 
 
+def append_data(target: dict, source: dict):
+    """Append source data (lists or arrays) to target numpy arrays in-place."""
+    for key in target:
+        if key in source and len(source[key]) > 0:
+            target[key] = np.concatenate([
+                target[key],
+                np.asarray(source[key], dtype=np.float32),
+            ])
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
-# Tensor Management Utilities
+# Commented-out pure Python versions (previously used as fallbacks)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def dict_to_tensors(data: dict):
-    """Convert dict-of-lists to tensors (for bullets/particles).
-
-    Returns tuple of tensors, or None if MAX not available.
-    """
-    if not MAX_AVAILABLE or not data['x']:
-        return None
-
-    try:
-        if 'life' in data:
-            # Particles
-            return (
-                Tensor.constant(data['x']),
-                Tensor.constant(data['y']),
-                Tensor.constant(data['vx']),
-                Tensor.constant(data['vy']),
-                data['life']  # Keep life as list for now
-            )
-        else:
-            # Bullets
-            return (
-                Tensor.constant(data['x']),
-                Tensor.constant(data['y']),
-                Tensor.constant(data['vx']),
-                Tensor.constant(data['vy'])
-            )
-    except Exception:
-        return None
-
-
-def concat_tensors(existing_tensors, new_dict: dict):
-    """Concatenate new dict data to existing tensors.
-
-    Args:
-        existing_tensors: Tuple of existing tensors (or None)
-        new_dict: Dict with new data to append
-
-    Returns:
-        New tuple of concatenated tensors
-    """
-    if not MAX_AVAILABLE or not new_dict['x']:
-        return existing_tensors
-
-    try:
-        import numpy as np
-
-        if existing_tensors is None or len(existing_tensors[0].to_numpy()) == 0:
-            # No existing data, just create new tensors
-            return dict_to_tensors(new_dict)
-
-        # Convert to numpy, concatenate, convert back to tensor
-        if len(existing_tensors) == 5:
-            # Particles (with life)
-            x_np = np.concatenate([existing_tensors[0].to_numpy(), new_dict['x']])
-            y_np = np.concatenate([existing_tensors[1].to_numpy(), new_dict['y']])
-            vx_np = np.concatenate([existing_tensors[2].to_numpy(), new_dict['vx']])
-            vy_np = np.concatenate([existing_tensors[3].to_numpy(), new_dict['vy']])
-            life_list = existing_tensors[4] + new_dict['life']
-
-            return (
-                Tensor.constant(x_np.tolist()),
-                Tensor.constant(y_np.tolist()),
-                Tensor.constant(vx_np.tolist()),
-                Tensor.constant(vy_np.tolist()),
-                life_list
-            )
-        else:
-            # Bullets (no life)
-            x_np = np.concatenate([existing_tensors[0].to_numpy(), new_dict['x']])
-            y_np = np.concatenate([existing_tensors[1].to_numpy(), new_dict['y']])
-            vx_np = np.concatenate([existing_tensors[2].to_numpy(), new_dict['vx']])
-            vy_np = np.concatenate([existing_tensors[3].to_numpy(), new_dict['vy']])
-
-            return (
-                Tensor.constant(x_np.tolist()),
-                Tensor.constant(y_np.tolist()),
-                Tensor.constant(vx_np.tolist()),
-                Tensor.constant(vy_np.tolist())
-            )
-    except Exception:
-        return existing_tensors
-
-
-def filter_tensors(tensors, mask):
-    """Filter tensors using boolean mask.
-
-    Args:
-        tensors: Tuple of tensors
-        mask: Boolean numpy array
-
-    Returns:
-        New tuple of filtered tensors
-    """
-    if not MAX_AVAILABLE or tensors is None:
-        return tensors
-
-    try:
-        import numpy as np
-
-        if len(tensors) == 5:
-            # Particles (with life)
-            x_np = tensors[0].to_numpy()[mask]
-            y_np = tensors[1].to_numpy()[mask]
-            vx_np = tensors[2].to_numpy()[mask]
-            vy_np = tensors[3].to_numpy()[mask]
-            life_list = [tensors[4][i] for i in range(len(mask)) if mask[i]]
-
-            if len(x_np) == 0:
-                return (
-                    Tensor.constant([0.0]),  # Empty placeholder
-                    Tensor.constant([0.0]),
-                    Tensor.constant([0.0]),
-                    Tensor.constant([0.0]),
-                    []
-                )
-
-            return (
-                Tensor.constant(x_np.tolist()),
-                Tensor.constant(y_np.tolist()),
-                Tensor.constant(vx_np.tolist()),
-                Tensor.constant(vy_np.tolist()),
-                life_list
-            )
-        else:
-            # Bullets (no life)
-            x_np = tensors[0].to_numpy()[mask]
-            y_np = tensors[1].to_numpy()[mask]
-            vx_np = tensors[2].to_numpy()[mask]
-            vy_np = tensors[3].to_numpy()[mask]
-
-            if len(x_np) == 0:
-                return (
-                    Tensor.constant([0.0]),  # Empty placeholder
-                    Tensor.constant([0.0]),
-                    Tensor.constant([0.0]),
-                    Tensor.constant([0.0])
-                )
-
-            return (
-                Tensor.constant(x_np.tolist()),
-                Tensor.constant(y_np.tolist()),
-                Tensor.constant(vx_np.tolist()),
-                Tensor.constant(vy_np.tolist())
-            )
-    except Exception:
-        return tensors
+# def batch_update_positions(positions_flat, velocities_flat, dt):
+#     """Pure Python: pos + vel * dt."""
+#     if not positions_flat:
+#         return []
+#     return [p + v * dt for p, v in zip(positions_flat, velocities_flat)]
+#
+#
+# def batch_distance_squared(bullet_xs, bullet_ys, player_x, player_y):
+#     """Pure Python: squared distances."""
+#     if not bullet_xs:
+#         return []
+#     return [(bx - player_x) ** 2 + (by - player_y) ** 2
+#             for bx, by in zip(bullet_xs, bullet_ys)]
+#
+#
+# def update_bullets_py(bullets, dt):
+#     """Pure Python bullet update (list-based)."""
+#     if not bullets['x']:
+#         return bullets
+#     return {
+#         'x': [x + vx * dt for x, vx in zip(bullets['x'], bullets['vx'])],
+#         'y': [y + vy * dt for y, vy in zip(bullets['y'], bullets['vy'])],
+#         'vx': bullets['vx'],
+#         'vy': bullets['vy'],
+#     }
+#
+#
+# def update_particles_py(particles, dt):
+#     """Pure Python particle update with decay and filtering."""
+#     if not particles['x']:
+#         return particles
+#     result = {'x': [], 'y': [], 'vx': [], 'vy': [], 'life': []}
+#     for i in range(len(particles['x'])):
+#         life = particles['life'][i] - dt
+#         if life > 0:
+#             result['x'].append(particles['x'][i] + particles['vx'][i] * dt)
+#             result['y'].append(particles['y'][i] + particles['vy'][i] * dt)
+#             result['vx'].append(particles['vx'][i] * 0.98)
+#             result['vy'].append(particles['vy'][i] * 0.98)
+#             result['life'].append(life)
+#     return result
