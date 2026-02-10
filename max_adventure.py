@@ -618,7 +618,7 @@ class Game:
         # Bullet count (performance indicator)
         n_bullets = len(self.bullets['x'])
         n_particles = len(self.particles['x'])
-        engine = "MAX Graph"
+        engine = "MAX Graph (GPU)"
 
         perf_text = self.font_small.render(
             f"{engine} | Bullets: {n_bullets} | Particles: {n_particles}",
