@@ -92,119 +92,108 @@ def batch_distance_squared(bullet_xs: list, bullet_ys: list,
 
 
 def generate_explosion_particles(cx: float, cy: float, count: int = 20,
-                                 speed: float = 200.0) -> list:
+                                 speed: float = 200.0) -> dict:
     """Generate explosion particle data using MAX tensors for random angles.
 
-    Returns flat list: [x, y, vx, vy, lifetime, ...] with stride 5
+    Returns dict with SoA format: {'x': [...], 'y': [...], 'vx': [...], 'vy': [...], 'life': [...]}
     """
-    particles = []
+    xs, ys, vxs, vys, lives = [], [], [], [], []
     for i in range(count):
         angle = 2.0 * math.pi * i / count + random.uniform(-0.2, 0.2)
         spd = speed * random.uniform(0.5, 1.5)
         vx = math.cos(angle) * spd
         vy = math.sin(angle) * spd
         lifetime = random.uniform(0.3, 0.8)
-        particles.extend([cx, cy, vx, vy, lifetime])
-    return particles
+        xs.append(cx)
+        ys.append(cy)
+        vxs.append(vx)
+        vys.append(vy)
+        lives.append(lifetime)
+    return {'x': xs, 'y': ys, 'vx': vxs, 'vy': vys, 'life': lives}
 
 
-def generate_trail_particle(x: float, y: float) -> list:
+def generate_trail_particle(x: float, y: float) -> dict:
     """Generate a single trail particle behind the player.
 
-    Returns: [x, y, vx, vy, lifetime]
+    Returns: dict with single element in each array
     """
     vx = random.uniform(-20, 20)
     vy = random.uniform(10, 40)  # drift downward
     lifetime = random.uniform(0.15, 0.35)
-    return [x, y, vx, vy, lifetime]
+    return {'x': [x], 'y': [y], 'vx': [vx], 'vy': [vy], 'life': [lifetime]}
 
 
-def update_bullets(bullets_flat: list, dt: float) -> list:
+def update_bullets(bullets: dict, dt: float) -> dict:
     """Update bullet positions using MAX tensors for vectorized computation.
 
-    Bullets are stored as flat list with stride 4: [x, y, vx, vy, ...]
+    Bullets are stored as SoA dict: {'x': [...], 'y': [...], 'vx': [...], 'vy': [...]}
 
     Args:
-        bullets_flat: Flat list of [x0, y0, vx0, vy0, x1, y1, vx1, vy1, ...]
+        bullets: Dict with separate arrays for x, y, vx, vy
         dt: Delta time in seconds
 
     Returns:
-        Updated flat bullet list with same stride-4 format
+        Updated dict with same structure
     """
-    if not bullets_flat:
-        return []
+    if not bullets['x']:
+        return bullets
 
     if MAX_AVAILABLE:
         try:
-            # Extract positions and velocities with stride 4
-            positions = [bullets_flat[i] for i in range(0, len(bullets_flat), 4)] + \
-                       [bullets_flat[i] for i in range(1, len(bullets_flat), 4)]
-            velocities = [bullets_flat[i] for i in range(2, len(bullets_flat), 4)] + \
-                        [bullets_flat[i] for i in range(3, len(bullets_flat), 4)]
+            # Direct tensor operations on arrays - no stride extraction needed
+            x_tensor = Tensor.constant(bullets['x'])
+            y_tensor = Tensor.constant(bullets['y'])
+            vx_tensor = Tensor.constant(bullets['vx'])
+            vy_tensor = Tensor.constant(bullets['vy'])
+            dt_tensor = Tensor.constant([dt] * len(bullets['x']))
 
-            # Vectorized update
-            pos_tensor = Tensor.constant(positions)
-            vel_tensor = Tensor.constant(velocities)
-            dt_tensor = Tensor.constant([dt] * len(positions))
+            # Vectorized position update: pos += vel * dt
+            new_x = x_tensor + vx_tensor * dt_tensor
+            new_y = y_tensor + vy_tensor * dt_tensor
 
-            updated_pos = pos_tensor + vel_tensor * dt_tensor
-            updated_list = updated_pos.to_numpy().tolist()
-
-            # Reconstruct stride-4 format: [x, y, vx, vy, ...]
-            n_bullets = len(bullets_flat) // 4
-            result = []
-            for i in range(n_bullets):
-                result.extend([
-                    updated_list[i],                    # x
-                    updated_list[i + n_bullets],        # y
-                    bullets_flat[i * 4 + 2],            # vx (unchanged)
-                    bullets_flat[i * 4 + 3]             # vy (unchanged)
-                ])
-            return result
+            return {
+                'x': new_x.to_numpy().tolist(),
+                'y': new_y.to_numpy().tolist(),
+                'vx': bullets['vx'],
+                'vy': bullets['vy']
+            }
         except Exception:
             pass
 
-    # Pure Python fallback
-    updated = []
-    for i in range(0, len(bullets_flat), 4):
-        x = bullets_flat[i] + bullets_flat[i+2] * dt
-        y = bullets_flat[i+1] + bullets_flat[i+3] * dt
-        updated.extend([x, y, bullets_flat[i+2], bullets_flat[i+3]])
-    return updated
+    # Pure Python fallback using dict format
+    return {
+        'x': [x + vx * dt for x, vx in zip(bullets['x'], bullets['vx'])],
+        'y': [y + vy * dt for y, vy in zip(bullets['y'], bullets['vy'])],
+        'vx': bullets['vx'],
+        'vy': bullets['vy']
+    }
 
 
-def update_particles(particles_flat: list, dt: float) -> list:
+def update_particles(particles: dict, dt: float) -> dict:
     """Update particle positions with velocity decay and lifetime.
 
-    Particles are stored as flat list with stride 5: [x, y, vx, vy, lifetime, ...]
+    Particles are stored as SoA dict: {'x': [...], 'y': [...], 'vx': [...], 'vy': [...], 'life': [...]}
     Applies 0.98 velocity decay and filters out expired particles.
 
     Args:
-        particles_flat: Flat list of [x0, y0, vx0, vy0, life0, ...]
+        particles: Dict with separate arrays for x, y, vx, vy, life
         dt: Delta time in seconds
 
     Returns:
-        Updated flat particle list with expired particles removed
+        Updated dict with expired particles removed
     """
-    if not particles_flat:
-        return []
+    if not particles['x']:
+        return particles
 
     if MAX_AVAILABLE:
         try:
-            n_particles = len(particles_flat) // 5
+            n_particles = len(particles['x'])
 
-            # Extract components
-            xs = [particles_flat[i*5] for i in range(n_particles)]
-            ys = [particles_flat[i*5+1] for i in range(n_particles)]
-            vxs = [particles_flat[i*5+2] for i in range(n_particles)]
-            vys = [particles_flat[i*5+3] for i in range(n_particles)]
-            lives = [particles_flat[i*5+4] for i in range(n_particles)]
-
-            # Vectorized position update
-            x_tensor = Tensor.constant(xs)
-            y_tensor = Tensor.constant(ys)
-            vx_tensor = Tensor.constant(vxs)
-            vy_tensor = Tensor.constant(vys)
+            # Direct tensor operations on separate arrays
+            x_tensor = Tensor.constant(particles['x'])
+            y_tensor = Tensor.constant(particles['y'])
+            vx_tensor = Tensor.constant(particles['vx'])
+            vy_tensor = Tensor.constant(particles['vy'])
             dt_tensor = Tensor.constant([dt] * n_particles)
             decay = Tensor.constant([0.98] * n_particles)
 
@@ -218,25 +207,46 @@ def update_particles(particles_flat: list, dt: float) -> list:
             new_vxs = new_vx.to_numpy().tolist()
             new_vys = new_vy.to_numpy().tolist()
 
-            # Reconstruct with lifetime filter
-            result = []
+            # Filter particles: only include indices where life > 0
+            filtered_xs, filtered_ys, filtered_vxs, filtered_vys, filtered_lives = [], [], [], [], []
             for i in range(n_particles):
-                new_life = lives[i] - dt
+                new_life = particles['life'][i] - dt
                 if new_life > 0:
-                    result.extend([new_xs[i], new_ys[i], new_vxs[i],
-                                  new_vys[i], new_life])
-            return result
+                    filtered_xs.append(new_xs[i])
+                    filtered_ys.append(new_ys[i])
+                    filtered_vxs.append(new_vxs[i])
+                    filtered_vys.append(new_vys[i])
+                    filtered_lives.append(new_life)
+
+            return {
+                'x': filtered_xs,
+                'y': filtered_ys,
+                'vx': filtered_vxs,
+                'vy': filtered_vys,
+                'life': filtered_lives
+            }
         except Exception:
             pass
 
-    # Pure Python fallback
-    updated = []
-    for i in range(0, len(particles_flat), 5):
-        x = particles_flat[i] + particles_flat[i+2] * dt
-        y = particles_flat[i+1] + particles_flat[i+3] * dt
-        vx = particles_flat[i+2] * 0.98
-        vy = particles_flat[i+3] * 0.98
-        life = particles_flat[i+4] - dt
+    # Pure Python fallback using dict format
+    filtered_xs, filtered_ys, filtered_vxs, filtered_vys, filtered_lives = [], [], [], [], []
+    for i in range(len(particles['x'])):
+        x = particles['x'][i] + particles['vx'][i] * dt
+        y = particles['y'][i] + particles['vy'][i] * dt
+        vx = particles['vx'][i] * 0.98
+        vy = particles['vy'][i] * 0.98
+        life = particles['life'][i] - dt
         if life > 0:
-            updated.extend([x, y, vx, vy, life])
-    return updated
+            filtered_xs.append(x)
+            filtered_ys.append(y)
+            filtered_vxs.append(vx)
+            filtered_vys.append(vy)
+            filtered_lives.append(life)
+
+    return {
+        'x': filtered_xs,
+        'y': filtered_ys,
+        'vx': filtered_vxs,
+        'vy': filtered_vys,
+        'life': filtered_lives
+    }
