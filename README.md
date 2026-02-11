@@ -37,60 +37,10 @@ compiled Mojo module, with MAX Tensor operations for batch vectorized math.
 max_adventure/
 ├── pixi.toml              # Pixi project manifest (Mojo + Python + Pygame)
 ├── max_adventure.py        # Main game — Pygame loop, rendering, game logic
-├── physics_engine.mojo     # Mojo module — high-perf bullet/particle physics
 ├── tensor_ops.py           # MAX Tensor API — batch vectorized operations
 └── README.md               # This file
 ```
 
-### How the pieces fit together
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                    max_adventure.py                      │
-│              (Pygame rendering + game logic)             │
-│                                                         │
-│  ┌───────────────────┐      ┌────────────────────────┐  │
-│  │  physics_engine    │      │     tensor_ops.py      │  │
-│  │     (Mojo 🔥)     │      │   (MAX Tensor API)     │  │
-│  │                   │      │                        │  │
-│  │ • update_bullets  │      │ • batch_update_pos     │  │
-│  │ • check_collisions│      │ • batch_distance_sq    │  │
-│  │ • spawn_radial    │      │ • explosion_particles  │  │
-│  │ • spawn_spiral    │      │ • trail_particles      │  │
-│  │ • update_particles│      │                        │  │
-│  └───────────────────┘      └────────────────────────┘  │
-│           │                          │                   │
-│     PythonModuleBuilder        Tensor.constant()         │
-│     (Mojo→Python interop)      + element-wise ops        │
-└─────────────────────────────────────────────────────────┘
-```
-
-### Why Mojo for physics?
-
-In a bullet hell game, you need to update and collision-check **hundreds of
-bullets every frame** at 60fps. Pure Python would struggle with this. The Mojo
-physics engine (`physics_engine.mojo`) handles:
-
-1. **Bullet position updates** — Euler integration on flat arrays (stride-4)
-2. **Collision detection** — Squared-distance checks against player hitbox
-3. **Pattern generation** — Radial and spiral burst math (sin/cos)
-4. **Particle effects** — Lifetime decay with drag on visual particles
-
-All of this runs as compiled native code via Mojo, called from Python through
-the `PythonModuleBuilder` interop system. The flat-array layout
-(`[x,y,vx,vy,x,y,vx,vy,...]`) is cache-friendly and avoids Python object
-overhead.
-
-### MAX Tensor API usage
-
-`tensor_ops.py` demonstrates the MAX Tensor API for batch operations:
-
-- `Tensor.constant()` to create tensors from Python lists
-- Element-wise `+`, `*` operators for vectorized position updates
-- `DType.float32` for efficient GPU-ready data types
-- Graceful fallback to pure Python when MAX isn't available
-
----
 
 ## 📦 Setup & Run
 
@@ -130,43 +80,6 @@ pixi run python max_adventure.py
 
 ---
 
-## 🔧 Technical Details
-
-### Mojo↔Python Interop
-
-The `physics_engine.mojo` file uses `PythonModuleBuilder` to expose functions:
-
-```mojo
-@export
-fn PyInit_physics_engine() -> PythonObject:
-    var m = PythonModuleBuilder("physics_engine")
-    m.def_function[update_bullets]("update_bullets", ...)
-    return m.finalize()
-```
-
-Python imports it transparently via `max.mojo.importer`:
-
-```python
-import max.mojo.importer
-import physics_engine  # Mojo module, used like any Python module
-
-result = physics_engine.update_bullets(flat_bullet_list, dt)
-```
-
-### Data Layout
-
-Bullets use a flat array with stride 4: `[x, y, vx, vy, x, y, vx, vy, ...]`
-
-This avoids the overhead of Python objects per bullet and allows Mojo to iterate
-through contiguous memory efficiently. Particles use stride 5 with an additional
-`lifetime` field.
-
-### Graceful Degradation
-
-The game runs even without Mojo/MAX installed — all physics functions have pure
-Python fallbacks. The HUD shows whether you're running with `🔥 Mojo` or
-`🐍 Python` physics.
-
 ---
 
 ## 📚 References
@@ -175,5 +88,4 @@ Python fallbacks. The HUD shows whether you're running with `🔥 Mojo` or
 - [MAX Tensor fundamentals](https://docs.modular.com/max/develop/tensors)
 - [MAX Data types (dtype)](https://docs.modular.com/max/develop/dtypes)
 - [MAX Basic operations](https://docs.modular.com/max/develop/basic-ops)
-- [Calling Mojo from Python](https://docs.modular.com/mojo/manual/python/mojo-from-python/)
 - [Modular GitHub](https://github.com/modularml/modular)
